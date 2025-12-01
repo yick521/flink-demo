@@ -7,6 +7,8 @@ import io.lettuce.core.cluster.ClusterClientOptions;
 import io.lettuce.core.cluster.RedisClusterClient;
 import io.lettuce.core.cluster.api.StatefulRedisClusterConnection;
 import io.lettuce.core.cluster.api.async.RedisAdvancedClusterAsyncCommands;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.io.Serializable;
 import java.time.Duration;
@@ -24,6 +26,7 @@ import java.util.stream.Collectors;
  */
 public class KvrocksClient implements Serializable {
 
+    private static final Logger LOG = LoggerFactory.getLogger(KvrocksClient.class);
     private static final long serialVersionUID = 1L;
 
     private final String host;
@@ -64,16 +67,14 @@ public class KvrocksClient implements Serializable {
 
             clusterConnection = clusterClient.connect();
 
-            System.out.println(String.format(
-                    "✅ Lettuce集群连接初始化成功：%s:%d (真异步模式)", host, port
-            ));
+            LOG.info("✅ Lettuce集群连接初始化成功：{}:{} (真异步模式)", host, port);
 
         } else {
             // 单机模式
             standaloneClient = RedisClient.create(
                     RedisURI.Builder
                             .redis(host, port)
-                            .withTimeout(Duration.ofSeconds(5))
+                            .withTimeout(Duration.ofSeconds(60))
                             .build()
             );
 
@@ -85,9 +86,7 @@ public class KvrocksClient implements Serializable {
 
             standaloneConnection = standaloneClient.connect();
 
-            System.out.println(String.format(
-                    "✅ Lettuce单机连接初始化成功：%s:%d (真异步模式)", host, port
-            ));
+            LOG.info("✅ Lettuce单机连接初始化成功：{}:{} (真异步模式)", host, port);
         }
     }
 
@@ -102,8 +101,8 @@ public class KvrocksClient implements Serializable {
                 return async.get(key)
                         .toCompletableFuture()
                         .exceptionally(ex -> {
-                            System.err.println("KVRocks GET失败: " + key + ", " + ex.getMessage());
-                            return null;
+                            LOG.error("KVRocks GET失败: {}, {}", key, ex.getMessage());
+                            throw new RuntimeException("KVRocks GET失败", ex);  // 重新抛出
                         });
             } else {
                 RedisAsyncCommands<String, String> async =
@@ -111,8 +110,8 @@ public class KvrocksClient implements Serializable {
                 return async.get(key)
                         .toCompletableFuture()
                         .exceptionally(ex -> {
-                            System.err.println("KVRocks GET失败: " + key + ", " + ex.getMessage());
-                            return null;
+                            LOG.error("KVRocks GET失败: {}, {}", key, ex.getMessage());
+                            throw new RuntimeException("KVRocks GET失败", ex);  // 重新抛出
                         });
             }
         } catch (Exception e) {
@@ -132,8 +131,8 @@ public class KvrocksClient implements Serializable {
                         .toCompletableFuture()
                         .thenApply(result -> (Void) null)  // ✅ 修复: 显式转换为Void
                         .exceptionally(ex -> {
-                            System.err.println("KVRocks SET失败: " + key + ", " + ex.getMessage());
-                            return null;
+                            LOG.error("KVRocks SET失败: {}, {}", key, ex.getMessage());
+                            throw new RuntimeException("KVRocks GET失败", ex);  // 重新抛出
                         });
             } else {
                 RedisAsyncCommands<String, String> async =
@@ -142,8 +141,8 @@ public class KvrocksClient implements Serializable {
                         .toCompletableFuture()
                         .thenApply(result -> (Void) null)  // ✅ 修复
                         .exceptionally(ex -> {
-                            System.err.println("KVRocks SET失败: " + key + ", " + ex.getMessage());
-                            return null;
+                            LOG.error("KVRocks SET失败: {}, {}", key, ex.getMessage());
+                            throw new RuntimeException("KVRocks GET失败", ex);  // 重新抛出
                         });
             }
         } catch (Exception e) {
@@ -311,7 +310,7 @@ public class KvrocksClient implements Serializable {
                 return "PONG".equalsIgnoreCase(pong);
             }
         } catch (Exception e) {
-            System.err.println("KVRocks连接测试失败: " + e.getMessage());
+            LOG.error("KVRocks连接测试失败: {}", e.getMessage());
             return false;
         }
     }
@@ -384,7 +383,7 @@ public class KvrocksClient implements Serializable {
             }
 
         } catch (Exception e) {
-            System.err.println("批量查询失败: " + hashKey + ", " + e.getMessage());
+            LOG.error("批量查询失败: {}, {}", hashKey, e.getMessage());
         }
 
         return results;
@@ -439,7 +438,7 @@ public class KvrocksClient implements Serializable {
             }
 
         } catch (Exception e) {
-            System.err.println("批量写入失败: " + hashKey + ", " + e.getMessage());
+            LOG.error("批量写入失败: {}, {}", hashKey, e.getMessage());
         }
     }
 
@@ -453,7 +452,7 @@ public class KvrocksClient implements Serializable {
             }
             if (clusterClient != null) {
                 clusterClient.shutdown();
-                System.out.println("Lettuce集群连接已关闭");
+                LOG.info("Lettuce集群连接已关闭");
             }
 
             if (standaloneConnection != null) {
@@ -461,10 +460,10 @@ public class KvrocksClient implements Serializable {
             }
             if (standaloneClient != null) {
                 standaloneClient.shutdown();
-                System.out.println("Lettuce单机连接已关闭");
+                LOG.info("Lettuce单机连接已关闭");
             }
         } catch (Exception e) {
-            System.err.println("关闭Lettuce连接失败: " + e.getMessage());
+            LOG.error("关闭Lettuce连接失败: {}", e.getMessage());
         }
     }
 }

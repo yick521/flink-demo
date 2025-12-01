@@ -3,6 +3,8 @@ package com.zhugeio.demo.sink;
 import com.zhugeio.demo.model.IdOutput;
 import org.apache.flink.configuration.Configuration;
 import org.apache.flink.streaming.api.functions.sink.RichSinkFunction;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
@@ -10,6 +12,8 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 
 public class PerformanceMetricsSink extends RichSinkFunction<IdOutput> {
+
+    private static final Logger LOG = LoggerFactory.getLogger(PerformanceMetricsSink.class);
 
     private final String jobName;
 
@@ -39,7 +43,7 @@ public class PerformanceMetricsSink extends RichSinkFunction<IdOutput> {
         long latency = value.getLatency();
         recordCount.incrementAndGet();
         totalLatency.addAndGet(latency);
-        
+
         // 更新最小和最大延迟值
         if (latency < minLatency) {
             minLatency = latency;
@@ -59,20 +63,23 @@ public class PerformanceMetricsSink extends RichSinkFunction<IdOutput> {
         double qps = count * 1000.0 / elapsed;
         double avgLatency = (double) totalLatency.get() / count;
 
-        System.out.println(String.format(
-                "\n========== [%s] 性能统计 ==========\n" +
-                        "总记录数: %d\n" +
-                        "运行时间: %d 秒\n" +
-                        "吞吐量: %.2f QPS\n" +
+        // ✅ 修复：使用 String.format 格式化浮点数
+        LOG.info("\n========== [{}] 性能统计 ==========\n" +
+                        "总记录数: {}\n" +
+                        "运行时间: {} 秒\n" +
+                        "吞吐量: {} QPS\n" +
                         "延迟统计(ms):\n" +
-                        "  - 最小: %d\n" +
-                        "  - 最大: %d\n" +
-                        "  - 平均: %.2f\n" +
-                        "=====================================\n",
-                jobName, count, elapsed / 1000, qps,
+                        "  - 最小: {}\n" +
+                        "  - 最大: {}\n" +
+                        "  - 平均: {}\n" +
+                        "=====================================",
+                jobName,
+                count,
+                elapsed / 1000,
+                String.format("%.2f", qps),
                 minLatency == Long.MAX_VALUE ? 0 : minLatency,
-                maxLatency, avgLatency
-        ));
+                maxLatency,
+                String.format("%.2f", avgLatency));
     }
 
     @Override

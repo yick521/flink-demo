@@ -14,6 +14,8 @@ import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
 import org.apache.flink.streaming.api.windowing.assigners.TumblingProcessingTimeWindows;
 import org.apache.flink.streaming.api.windowing.time.Time;
 import org.apache.flink.streaming.api.CheckpointingMode;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.io.Serializable;
 import java.util.concurrent.TimeUnit;
@@ -43,6 +45,8 @@ import java.util.concurrent.TimeUnit;
  * --exactly-once true             # 是否启用Exactly-Once
  */
 public class PerformanceComparisonJob {
+
+    private static final Logger LOG = LoggerFactory.getLogger(PerformanceComparisonJob.class);
 
     public static void main(String[] args) throws Exception {
 
@@ -78,38 +82,38 @@ public class PerformanceComparisonJob {
         long totalRecords = maxRecordsPerSubtask * parallelism;
 
         // ========== 打印配置 ==========
-        System.out.println("========== ETL ID模块性能测试（完整版） ==========");
-        System.out.println("模式: " + mode);
-        System.out.println("QPS(每并行度): " + qps);
-        System.out.println("并行度: " + parallelism);
-        System.out.println("总QPS: " + (qps * parallelism));
-        System.out.println("测试时长: " + durationSeconds + " 秒 (" +
-                String.format("%.2f", durationSeconds / 3600.0) + " 小时)");
-        System.out.println("预计总数据量: " +
-                String.format("%.2f", totalRecords / 100000000.0) + " 亿条");
-        System.out.println("每条记录字段数: 150+");
+        LOG.info("========== ETL ID模块性能测试（完整版） ==========");
+        LOG.info("模式: {}", mode);
+        LOG.info("QPS(每并行度): {}", qps);
+        LOG.info("并行度: {}", parallelism);
+        LOG.info("总QPS: {}", (qps * parallelism));
+        LOG.info("测试时长: {} 秒 ({})",
+                durationSeconds, String.format("%.2f", durationSeconds / 3600.0));
+        LOG.info("预计总数据量: {} 亿条",
+                String.format("%.2f", totalRecords / 100000000.0));
+        LOG.info("每条记录字段数: 150+");
 
         if ("window".equals(mode)) {
-            System.out.println("窗口大小: " + windowSeconds + "秒");
+            LOG.info("窗口大小: {}秒", windowSeconds);
         } else {
-            System.out.println("AsyncIO容量: " + asyncCapacity);
+            LOG.info("AsyncIO容量: {}", asyncCapacity);
         }
 
-        System.out.println("\n---------- Checkpoint配置 ----------");
-        System.out.println("Checkpoint启用: " + checkpointEnabled);
+        LOG.info("\n---------- Checkpoint配置 ----------");
+        LOG.info("Checkpoint启用: {}", checkpointEnabled);
         if (checkpointEnabled) {
-            System.out.println("Checkpoint间隔: " + checkpointInterval + " ms");
-            System.out.println("Checkpoint模式: EXACTLY_ONCE");
+            LOG.info("Checkpoint间隔: {} ms", checkpointInterval);
+            LOG.info("Checkpoint模式: EXACTLY_ONCE");
         }
 
-        System.out.println("\n---------- Kafka配置 ----------");
-        System.out.println("Kafka输出启用: " + kafkaEnabled);
+        LOG.info("\n---------- Kafka配置 ----------");
+        LOG.info("Kafka输出启用: {}", kafkaEnabled);
         if (kafkaEnabled) {
-            System.out.println("Kafka Topic: " + kafkaTopic);
-            System.out.println("Kafka Brokers: " + kafkaBrokers);
-            System.out.println("Exactly-Once语义: " + exactlyOnce);
+            LOG.info("Kafka Topic: {}", kafkaTopic);
+            LOG.info("Kafka Brokers: {}", kafkaBrokers);
+            LOG.info("Exactly-Once语义: {}", exactlyOnce);
         }
-        System.out.println("===================================================\n");
+        LOG.info("===================================================\n");
 
         // ========== 创建执行环境 ==========
         StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
@@ -124,9 +128,9 @@ public class PerformanceComparisonJob {
             env.getCheckpointConfig().setCheckpointTimeout(600000);  // 10分钟超时
             env.getCheckpointConfig().setMaxConcurrentCheckpoints(1);
 
-            System.out.println("✅ Checkpoint已启用（Exactly-Once模式）\n");
+            LOG.info("✅ Checkpoint已启用（Exactly-Once模式）\n");
         } else {
-            System.out.println("⚠️  Checkpoint未启用（无容错保证）\n");
+            LOG.info("⚠️  Checkpoint未启用（无容错保证）\n");
         }
 
         // ========== 数据源 ==========
@@ -140,7 +144,7 @@ public class PerformanceComparisonJob {
         DataStream<IdOutput> result;
 
         if ("async".equals(mode)) {
-            result = processWithAsyncIO(source, asyncCapacity, kvrocksHost, kvrocksPort);
+            result = processWithAsyncIO(source, asyncCapacity, kvrocksHost, kvrocksPort, parallelism);
         } else if ("window".equals(mode)) {
             result = processWithWindow(source, windowSeconds, kvrocksHost, kvrocksPort);
         } else {
@@ -157,7 +161,7 @@ public class PerformanceComparisonJob {
                     exactlyOnce && checkpointEnabled  // Exactly-Once需要Checkpoint
             );
 
-            System.out.println("✅ Kafka Sink已添加（Topic: " + kafkaTopic + "）\n");
+            LOG.info("✅ Kafka Sink已添加（Topic: {}）\n", kafkaTopic);
         }
 
         // ========== 性能指标收集 ==========
@@ -173,7 +177,7 @@ public class PerformanceComparisonJob {
                 checkpointEnabled ? "-ON" : "-OFF"
         );
 
-        System.out.println("🚀 开始执行：" + jobName + "\n");
+        LOG.info("🚀 开始执行：{}\n", jobName);
 
         env.execute(jobName);
     }
@@ -182,43 +186,45 @@ public class PerformanceComparisonJob {
             DataStream<RawEvent> source,
             int capacity,
             String kvrocksHost,
-            int kvrocksPort) {
+            int kvrocksPort, int parallelism) {
 
-        System.out.println("📊 使用流式异步处理（AsyncIO + 真实KVRocks）\n");
+        LOG.info("📊 使用流式异步处理（AsyncIO + 真实KVRocks）\n");
 
         // 1. 设备ID映射
         SingleOutputStreamOperator<IdOutput> withDeviceId = AsyncDataStream.unorderedWait(
                         source,
                         new DeviceIdAsyncOperator(kvrocksHost, kvrocksPort, true),  // ← 传入KVRocks地址
-                        5000, TimeUnit.MILLISECONDS, capacity
-                ).name("DeviceId-AsyncIO")
-                .uid("device-id-async")
-                .setParallelism(4);
+                        70000, TimeUnit.MILLISECONDS, capacity
+                ).name("DeviceIdAsyncIO")
+                .uid("deviceidasync")
+                .setParallelism(parallelism);
 
         // 2. 会话ID处理
-        DataStream<IdOutput> withSessionId = withDeviceId
-                .process(new SessionIdProcessOperator())
-                .name("SessionId-Process")
-                .uid("session-id-process")
-                .setParallelism(4);
+        SingleOutputStreamOperator<IdOutput> withSessionId = AsyncDataStream.unorderedWait(
+                        withDeviceId,
+                        new SessionIdAsyncOperator(),  // ← 传入KVRocks地址
+                        70000, TimeUnit.MILLISECONDS, capacity
+                ).name("UserIdAsyncIO")
+                .uid("sessionidasync")
+                .setParallelism(parallelism);
 
         // 3. 用户ID映射
         SingleOutputStreamOperator<IdOutput> withUserId = AsyncDataStream.unorderedWait(
                         withSessionId,
                         new UserIdAsyncOperator(kvrocksHost, kvrocksPort),  // ← 传入KVRocks地址
-                        5000, TimeUnit.MILLISECONDS, capacity
-                ).name("UserId-AsyncIO")
-                .uid("user-id-async")
-                .setParallelism(4);
+                        70000, TimeUnit.MILLISECONDS, capacity
+                ).name("UserIdAsyncIO")
+                .uid("useridasync")
+                .setParallelism(parallelism);
 
         // 4. 诸葛ID映射
         SingleOutputStreamOperator<IdOutput> withZgid = AsyncDataStream.unorderedWait(
                         withUserId,
                         new ZgidAsyncOperator(kvrocksHost, kvrocksPort),  // ← 传入KVRocks地址
-                        5000, TimeUnit.MILLISECONDS, capacity
-                ).name("Zgid-AsyncIO")
-                .uid("zgid-async")
-                .setParallelism(4);
+                        70000, TimeUnit.MILLISECONDS, capacity
+                ).name("ZgidAsyncIO")
+                .uid("zgidasync")
+                .setParallelism(parallelism);
 
         return withZgid;
     }
@@ -229,7 +235,7 @@ public class PerformanceComparisonJob {
     private static DataStream<IdOutput> processWithWindow(
             DataStream<RawEvent> source, int windowSeconds, String kvrocksHost, int kvrocksPort) {
 
-        System.out.println("📊 使用开窗批量处理（Window + 真实KVRocks）\n");
+        LOG.info("📊 使用开窗批量处理（Window + 真实KVRocks）\n");
         
         int parallelism = source.getParallelism();
 
@@ -237,8 +243,8 @@ public class PerformanceComparisonJob {
                 .keyBy(event -> event.getDeviceId())
                 .window(TumblingProcessingTimeWindows.of(Time.seconds(windowSeconds)))
                 .process(new IdWindowedBatchOperator(kvrocksHost, kvrocksPort, true))  // ← 传入KVRocks地址
-                .name("ID-WindowedBatch")
-                .uid("id-windowed-batch");
+                .name("IDWindowedBatch")
+                .uid("idwindowedbatch");
 
         return result;
     }

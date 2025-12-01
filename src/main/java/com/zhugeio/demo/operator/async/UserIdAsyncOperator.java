@@ -1,7 +1,5 @@
 package com.zhugeio.demo.operator.async;
 
-import com.github.benmanes.caffeine.cache.Cache;
-import com.github.benmanes.caffeine.cache.Caffeine;
 import com.zhugeio.demo.KvrocksClient;
 import com.zhugeio.demo.model.IdOutput;
 import com.zhugeio.demo.utils.SnowflakeIdGenerator;
@@ -9,24 +7,32 @@ import org.apache.commons.lang3.StringUtils;
 import org.apache.flink.configuration.Configuration;
 import org.apache.flink.streaming.api.functions.async.ResultFuture;
 import org.apache.flink.streaming.api.functions.async.RichAsyncFunction;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.util.Collections;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.TimeUnit;
 
 /**
- * 用户ID映射算子 (雪花算法版本)
+ * 用户ID映射算子 - 优雅关闭版本
  *
- * 优化点:
- * 1. ✅ 使用雪花算法生成ID,无需同步调用KVRocks incr
- * 2. ✅ 所有操作都是异步的
- * 3. ✅ workerId范围: 256-511 (与其他算子隔离)
+ * 修复点:
+ * 1. ✅ 使用CopyOnWriteArrayList追踪未完成的写入
+ * 2. ✅ 使用数组解决lambda变量作用域问题
+ * 3. ✅ close()时等待所有未完成的写入
+ * 4. ✅ 防止连接过早关闭导致数据丢失
  */
 public class UserIdAsyncOperator extends RichAsyncFunction<IdOutput, IdOutput> {
 
+    private static final Logger LOG = LoggerFactory.getLogger(UserIdAsyncOperator.class);
+
     private transient KvrocksClient kvrocks;
-    private transient Cache<String, Long> localCache;
-    private transient SnowflakeIdGenerator idGenerator;  // ✅ 新增
+    private transient SnowflakeIdGenerator idGenerator;
+
+    // ✅ 追踪未完成的写入
+    private transient CopyOnWriteArrayList<CompletableFuture<Void>> pendingWrites;
 
     private final String kvrocksHost;
     private final int kvrocksPort;
@@ -51,34 +57,24 @@ public class UserIdAsyncOperator extends RichAsyncFunction<IdOutput, IdOutput> {
         kvrocks = new KvrocksClient(kvrocksHost, kvrocksPort, kvrocksCluster);
         kvrocks.init();
 
-        // ✅ 初始化雪花算法生成器
-        // workerId范围: 256 + subtaskIndex (256-511)
-        // 避免与DeviceId(0-255)和Zgid(512-767)冲突
         int subtaskIndex = getRuntimeContext().getIndexOfThisSubtask();
         int totalSubtasks = getRuntimeContext().getNumberOfParallelSubtasks();
 
         if (totalSubtasks > 256) {
-            throw new RuntimeException(
-                    "UserId算子最多支持256个并行度,当前: " + totalSubtasks);
+            throw new RuntimeException("UserId算子最多支持256个并行度,当前: " + totalSubtasks);
         }
 
         int workerId = 256 + subtaskIndex;
         idGenerator = new SnowflakeIdGenerator(workerId);
 
-        localCache = Caffeine.newBuilder()
-                .maximumSize(10000)
-                .expireAfterWrite(10, TimeUnit.MINUTES)
-                .build();
+        // ✅ 初始化追踪列表
+        pendingWrites = new CopyOnWriteArrayList<>();
 
-        System.out.println(String.format(
-                "[UserId算子-%d] 雪花算法初始化成功, workerId=%d",
-                subtaskIndex, workerId
-        ));
+        LOG.info("[UserId算子-{}] 雪花算法初始化成功, workerId={}", subtaskIndex, workerId);
     }
 
     @Override
     public void asyncInvoke(IdOutput input, ResultFuture<IdOutput> resultFuture) {
-
         if (StringUtils.isBlank(input.getCuid())) {
             input.setZgUserId(null);
             input.setNewUser(false);
@@ -88,39 +84,32 @@ public class UserIdAsyncOperator extends RichAsyncFunction<IdOutput, IdOutput> {
 
         String cacheKey = "u:" + input.getAppId() + ":" + input.getCuid();
 
-        Long cachedZgUid = localCache.getIfPresent(cacheKey);
-        if (cachedZgUid != null) {
-            input.setZgUserId(cachedZgUid);
-            input.setNewUser(false);
-            resultFuture.complete(Collections.singleton(input));
-            return;
-        }
-
         kvrocks.asyncGet(cacheKey)
                 .thenCompose(zgUidStr -> {
-
                     if (zgUidStr != null) {
                         Long zgUserId = Long.parseLong(zgUidStr);
-                        localCache.put(cacheKey, zgUserId);
-                        return CompletableFuture.completedFuture(
-                                new UserIdResult(zgUserId, false));
-
+                        return CompletableFuture.completedFuture(new UserIdResult(zgUserId, false));
                     } else {
-                        // ✅ 雪花算法生成
                         Long newUserId = idGenerator.nextId();
 
-                        // ✅ Fire-and-Forget: 后台异步写入,不等待
-                        kvrocks.asyncSet(cacheKey, String.valueOf(newUserId))
+                        // ✅ 使用数组解决lambda作用域问题
+                        CompletableFuture<Void>[] futureHolder = new CompletableFuture[1];
+                        futureHolder[0] = kvrocks.asyncSet(cacheKey, String.valueOf(newUserId))
                                 .whenComplete((v, throwable) -> {
+                                    // 完成后从列表中移除
+                                    pendingWrites.remove(futureHolder[0]);
+
                                     if (throwable != null) {
-                                        System.err.println("UserId写入失败: " + cacheKey);
+                                        LOG.error("[UserId算子-{}] UserId写入失败: {}",
+                                                getRuntimeContext().getIndexOfThisSubtask(),
+                                                cacheKey, throwable);
                                     }
                                 });
 
-                        // 立即返回
-                        localCache.put(cacheKey, newUserId);
-                        return CompletableFuture.completedFuture(
-                                new UserIdResult(newUserId, true));
+                        // 添加到追踪列表
+                        pendingWrites.add(futureHolder[0]);
+
+                        return CompletableFuture.completedFuture(new UserIdResult(newUserId, true));
                     }
                 })
                 .whenComplete((result, throwable) -> {
@@ -136,20 +125,41 @@ public class UserIdAsyncOperator extends RichAsyncFunction<IdOutput, IdOutput> {
 
     @Override
     public void close() throws Exception {
-        if (kvrocks != null) {
-            kvrocks.shutdown();
+        int subtaskIndex = getRuntimeContext().getIndexOfThisSubtask();
+
+        LOG.info("[UserId算子-{}] 开始关闭，等待未完成的写入...", subtaskIndex);
+
+        // ✅ 等待所有未完成的写入
+        if (pendingWrites != null && !pendingWrites.isEmpty()) {
+            long startWait = System.currentTimeMillis();
+            int pendingCount = pendingWrites.size();
+
+            LOG.info("[UserId算子-{}] 发现 {} 个未完成的写入操作，开始等待...",
+                    subtaskIndex, pendingCount);
+
+            try {
+                CompletableFuture<Void> allWrites = CompletableFuture.allOf(
+                        pendingWrites.toArray(new CompletableFuture[0])
+                );
+                allWrites.get(30, TimeUnit.SECONDS);
+
+                long waitTime = System.currentTimeMillis() - startWait;
+                LOG.info("[UserId算子-{}] ✅ 所有未完成的写入已完成，等待时间: {} ms",
+                        subtaskIndex, waitTime);
+
+            } catch (Exception e) {
+                long waitTime = System.currentTimeMillis() - startWait;
+                LOG.error("[UserId算子-{}] ⚠️  等待写入完成超时或失败，等待时间: {} ms, 剩余未完成: {}",
+                        subtaskIndex, waitTime, pendingWrites.size(), e);
+            }
         }
 
-        if (localCache != null) {
-            System.out.println(String.format(
-                    "[UserId算子-%d] 缓存统计: %s",
-                    getRuntimeContext().getIndexOfThisSubtask(),
-                    localCache.stats()
-            ));
+        if (kvrocks != null) {
+            kvrocks.shutdown();
+            LOG.info("[UserId算子-{}] KVRocks连接已关闭", subtaskIndex);
         }
     }
 
-    // 内部结果类
     private static class UserIdResult {
         final Long userId;
         final boolean isNew;
