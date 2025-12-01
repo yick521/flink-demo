@@ -9,24 +9,29 @@ import org.apache.flink.configuration.Configuration;
 import org.apache.flink.streaming.api.functions.windowing.ProcessWindowFunction;
 import org.apache.flink.streaming.api.windowing.windows.TimeWindow;
 import org.apache.flink.util.Collector;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.text.NumberFormat;
 import java.util.*;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.stream.Collectors;
 
 /**
- * 开窗批量处理算子 - 真正的Pipeline批量优化版
+ * 开窗批量处理算子 - 雪花算法版本
  *
- * 核心优化:
- * 1. ✅ 使用 syncBatchHGet 真正的Pipeline批量查询
- * 2. ✅ 雪花算法生成ID (无同步调用)
- * 3. ✅ 降级模式 (KVRocks故障时)
- * 4. ✅ Fire-and-Forget 写入
- * 5. ✅ 超时控制
+ * 优化点:
+ * 1. ✅ 移除所有 incr() 同步调用
+ * 2. ✅ 使用雪花算法生成ID
+ * 3. ✅ 三个独立的 SnowflakeIdGenerator (DeviceId/UserId/Zgid)
+ * 4. ✅ Fire-and-Forget 写入模式
  */
 public class IdWindowedBatchOperator
         extends ProcessWindowFunction<RawEvent, IdOutput, Integer, TimeWindow> {
+
+    private static final Logger LOG = LoggerFactory.getLogger(IdWindowedBatchOperator.class);
 
     private transient KvrocksClient kvrocks;
 
@@ -87,15 +92,13 @@ public class IdWindowedBatchOperator
             kvrocks.init();
 
         } catch (Exception e) {
-            System.err.println("[Window-" + subtaskIndex + "] KVRocks初始化失败: " + e.getMessage());
+            LOG.error("[Window-{}] KVRocks初始化失败: {}", subtaskIndex, e.getMessage());
             kvrocks = null;
         }
 
-        System.out.println(String.format(
-                "[Window-%d] 初始化: DeviceId=%d, UserId=%d, Zgid=%d, KVRocks=%s, Pipeline超时=%dms",
+        LOG.info("[Window-{}] 初始化: DeviceId={}, UserId={}, Zgid={}, KVRocks={}, Pipeline超时={}ms",
                 subtaskIndex, subtaskIndex, 256 + subtaskIndex, 512 + subtaskIndex,
-                "可用" , PIPELINE_TIMEOUT_MS
-        ));
+                "可用", PIPELINE_TIMEOUT_MS);
     }
 
     @Override
@@ -111,7 +114,7 @@ public class IdWindowedBatchOperator
             return;
         }
 
-        totalWindows.incrementAndGet();
+//        totalWindows.incrementAndGet();
         totalEvents.addAndGet(batch.size());
 
 
@@ -133,7 +136,7 @@ public class IdWindowedBatchOperator
                     .collect(Collectors.toList());
 
             // ✅ 使用真正的Pipeline批量查询
-            pipelineQueries.incrementAndGet();
+//            pipelineQueries.incrementAndGet();
             Map<String, String> results = kvrocks.syncBatchHGet(hashKey, fields, PIPELINE_TIMEOUT_MS);
             deviceResults.putAll(results);
         }
@@ -165,13 +168,11 @@ public class IdWindowedBatchOperator
 
             if (!toWrite.isEmpty()) {
                 // 异步写入,不等待
-                new Thread(() -> {
-                    try {
-                        kvrocks.syncBatchHSet(hashKey, toWrite, 1000);
-                    } catch (Exception e) {
-                        // 忽略写入失败
-                    }
-                }).start();
+                try {
+                    kvrocks.syncBatchHSet(hashKey, toWrite, 1000);
+                } catch (Exception e) {
+                    // 忽略写入失败
+                }
             }
         }
 
@@ -192,7 +193,7 @@ public class IdWindowedBatchOperator
                     .distinct()
                     .collect(Collectors.toList());
 
-            pipelineQueries.incrementAndGet();
+//            pipelineQueries.incrementAndGet();
             Map<String, String> results = kvrocks.syncBatchHGet(hashKey, fields, PIPELINE_TIMEOUT_MS);
             userResults.putAll(results);
         }
@@ -227,13 +228,11 @@ public class IdWindowedBatchOperator
             }
 
             if (!toWrite.isEmpty()) {
-                new Thread(() -> {
-                    try {
-                        kvrocks.syncBatchHSet(hashKey, toWrite, 1000);
-                    } catch (Exception e) {
-                        // 忽略
-                    }
-                }).start();
+                try {
+                    kvrocks.syncBatchHSet(hashKey, toWrite, 1000);
+                } catch (Exception e) {
+                    // 忽略
+                }
             }
         }
 
@@ -256,47 +255,45 @@ public class IdWindowedBatchOperator
             String hashKey = "z:" + appId;
             List<String> fields = entry.getValue().stream().distinct().collect(Collectors.toList());
 
-            pipelineQueries.incrementAndGet();
+//            pipelineQueries.incrementAndGet();
             Map<String, String> results = kvrocks.syncBatchHGet(hashKey, fields, PIPELINE_TIMEOUT_MS);
             zgidResults.putAll(results);
         }
 
-        // 生成缺失的诸葛ID
-        Map<String, String> newZgids = new HashMap<>();
-        for (RawEvent event : batch) {
-            String field = getZgidField(event, userResults, deviceResults);
-            if (field == null) continue;
+            // 生成缺失的诸葛ID
+            Map<String, String> newZgids = new HashMap<>();
+            for (RawEvent event : batch) {
+                String field = getZgidField(event, userResults, deviceResults);
+                if (field == null) continue;
 
-            String zgidKey = "z:" + event.getAppId() + ":" + field;
+                String zgidKey = "z:" + event.getAppId() + ":" + field;
 
-            if (!zgidResults.containsKey(zgidKey)) {
-                Long newZgid = zgidGenerator.nextId();
-                zgidResults.put(zgidKey, String.valueOf(newZgid));
-                newZgids.put(field, String.valueOf(newZgid));
+                if (!zgidResults.containsKey(zgidKey)) {
+                    Long newZgid = zgidGenerator.nextId();
+                    zgidResults.put(zgidKey, String.valueOf(newZgid));
+                    newZgids.put(field, String.valueOf(newZgid));
+                }
             }
-        }
 
-        // Fire-and-Forget 写入新的诸葛ID
-        for (Map.Entry<Integer, List<String>> entry : zgidFieldsByApp.entrySet()) {
-            Integer appId = entry.getKey();
-            String hashKey = "z:" + appId;
+            // Fire-and-Forget 写入新的诸葛ID
+            for (Map.Entry<Integer, List<String>> entry : zgidFieldsByApp.entrySet()) {
+                Integer appId = entry.getKey();
+                String hashKey = "z:" + appId;
 
-            Map<String, String> toWrite = new HashMap<>();
-            for (String field : entry.getValue()) {
-                String zgidKey = "z:" + appId + ":" + field;
+                Map<String, String> toWrite = new HashMap<>();
+                for (String field : entry.getValue()) {
+                    String zgidKey = "z:" + appId + ":" + field;
                 if (newZgids.containsKey(field)) {
                     toWrite.put(field, zgidResults.get(zgidKey));
                 }
             }
 
             if (!toWrite.isEmpty()) {
-                new Thread(() -> {
-                    try {
-                        kvrocks.syncBatchHSet(hashKey, toWrite, 1000);
-                    } catch (Exception e) {
-                        // 忽略
-                    }
-                }).start();
+                try {
+                    kvrocks.syncBatchHSet(hashKey, toWrite, 1000);
+                } catch (Exception e) {
+                    // 忽略
+                }
             }
         }
 
@@ -407,11 +404,9 @@ public class IdWindowedBatchOperator
         long queries = pipelineQueries.get();
 
         if (windows > 0) {
-            System.out.println(String.format(
-                    "[Window-%d] 统计: 窗口=%d, 事件=%d, 平均批次=%.1f, Pipeline查询=%d",
+            LOG.info("[Window-{}] 统计: 窗口={}, 事件={}, 平均批次={}, Pipeline查询={}",
                     getRuntimeContext().getIndexOfThisSubtask(),
-                    windows, events, events * 1.0 / windows, queries
-            ));
+                    windows, events, events * 1.0 / windows, queries);
         }
     }
 }

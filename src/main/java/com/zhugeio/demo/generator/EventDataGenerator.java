@@ -2,6 +2,8 @@ package com.zhugeio.demo.generator;
 
 import com.zhugeio.demo.model.RawEvent;
 import org.apache.flink.streaming.api.functions.source.RichParallelSourceFunction;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.util.Random;
 import java.util.concurrent.TimeUnit;
@@ -18,6 +20,8 @@ import java.util.concurrent.TimeUnit;
  * - 总数据量: 48000 * 3600 * 3 = 5.184亿
  */
 public class EventDataGenerator extends RichParallelSourceFunction<RawEvent> {
+
+    private static final Logger LOG = LoggerFactory.getLogger(EventDataGenerator.class);
 
     private volatile boolean running = true;
     private final int qps;
@@ -67,10 +71,8 @@ public class EventDataGenerator extends RichParallelSourceFunction<RawEvent> {
         long recordCount = 0;
         long startTime = System.currentTimeMillis();
 
-        System.out.println(String.format(
-                "[Generator-%d] 启动，目标QPS: %d, 最大记录数: %d",
-                subtaskIndex, qps, maxRecords
-        ));
+        LOG.info("[Generator-{}] 启动，目标QPS: {}, 最大记录数: {}",
+                subtaskIndex, qps, maxRecords);
 
         while (running && recordCount < maxRecords) {
             long iterStart = System.currentTimeMillis();
@@ -85,10 +87,8 @@ public class EventDataGenerator extends RichParallelSourceFunction<RawEvent> {
             if (recordCount % 100000 == 0) {
                 long elapsed = System.currentTimeMillis() - startTime;
                 double actualQps = recordCount * 1000.0 / elapsed;
-                System.out.println(String.format(
-                        "[Generator-%d] 已生成: %d 条, 实际QPS: %.2f, 运行时间: %d 秒",
-                        subtaskIndex, recordCount, actualQps, elapsed / 1000
-                ));
+                LOG.info("[Generator-{}] 已生成: {} 条, 实际QPS: {}, 运行时间: {} 秒",
+                        subtaskIndex, recordCount, String.format("%.2f", actualQps), elapsed / 1000);
             }
 
             // 控制速率
@@ -101,10 +101,8 @@ public class EventDataGenerator extends RichParallelSourceFunction<RawEvent> {
 
         long totalElapsed = System.currentTimeMillis() - startTime;
         double avgQps = recordCount * 1000.0 / totalElapsed;
-        System.out.println(String.format(
-                "[Generator-%d] 完成！总记录数: %d, 平均QPS: %.2f, 总耗时: %d 秒",
-                subtaskIndex, recordCount, avgQps, totalElapsed / 1000
-        ));
+        LOG.info("[Generator-{}] 完成！总记录数: {}, 平均QPS: {}, 总耗时: {} 秒",
+                subtaskIndex, recordCount, String.format("%.2f", avgQps), totalElapsed / 1000);
     }
 
     /**

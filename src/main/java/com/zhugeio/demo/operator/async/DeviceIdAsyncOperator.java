@@ -1,7 +1,5 @@
 package com.zhugeio.demo.operator.async;
 
-import com.github.benmanes.caffeine.cache.Cache;
-import com.github.benmanes.caffeine.cache.Caffeine;
 import com.zhugeio.demo.KvrocksClient;
 import com.zhugeio.demo.model.IdOutput;
 import com.zhugeio.demo.model.RawEvent;
@@ -9,24 +7,32 @@ import com.zhugeio.demo.utils.SnowflakeIdGenerator;
 import org.apache.flink.configuration.Configuration;
 import org.apache.flink.streaming.api.functions.async.ResultFuture;
 import org.apache.flink.streaming.api.functions.async.RichAsyncFunction;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.util.Collections;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.TimeUnit;
 
 /**
- * 设备ID异步映射算子 (雪花算法版本)
+ * 设备ID异步映射算子 - 优雅关闭版本
  *
- * 优化点:
- * 1. ✅ 使用雪花算法生成ID,无需同步调用KVRocks incr
- * 2. ✅ 所有操作都是异步的
- * 3. ✅ workerId范围: 0-255 (与其他算子隔离)
+ * 修复点:
+ * 1. ✅ 使用CopyOnWriteArrayList追踪未完成的写入
+ * 2. ✅ 使用数组解决lambda变量作用域问题
+ * 3. ✅ close()时等待所有未完成的写入
+ * 4. ✅ 防止连接过早关闭导致数据丢失
  */
 public class DeviceIdAsyncOperator extends RichAsyncFunction<RawEvent, IdOutput> {
 
+    private static final Logger LOG = LoggerFactory.getLogger(DeviceIdAsyncOperator.class);
+
     private transient KvrocksClient kvrocks;
-    private transient Cache<String, Long> deviceCache;
-    private transient SnowflakeIdGenerator idGenerator;  // ✅ 新增
+    private transient SnowflakeIdGenerator idGenerator;
+
+    // ✅ 追踪未完成的写入
+    private transient CopyOnWriteArrayList<CompletableFuture<Void>> pendingWrites;
 
     private final String kvrocksHost;
     private final int kvrocksPort;
@@ -40,82 +46,61 @@ public class DeviceIdAsyncOperator extends RichAsyncFunction<RawEvent, IdOutput>
 
     @Override
     public void open(Configuration parameters) throws Exception {
-        // 初始化KVRocks客户端
         kvrocks = new KvrocksClient(kvrocksHost, kvrocksPort, kvrocksCluster);
         kvrocks.init();
 
-        // 测试连接
         if (!kvrocks.testConnection()) {
             throw new RuntimeException("KVRocks连接失败!");
         }
 
-        // ✅ 初始化雪花算法生成器
-        // workerId范围: 0-255 (subtaskIndex直接使用)
         int subtaskIndex = getRuntimeContext().getIndexOfThisSubtask();
         int totalSubtasks = getRuntimeContext().getNumberOfParallelSubtasks();
 
         if (totalSubtasks > 256) {
-            throw new RuntimeException(
-                    "DeviceId算子最多支持256个并行度,当前: " + totalSubtasks);
+            throw new RuntimeException("DeviceId算子最多支持256个并行度,当前: " + totalSubtasks);
         }
 
         idGenerator = new SnowflakeIdGenerator(subtaskIndex);
 
-        // 初始化Caffeine缓存
-        deviceCache = Caffeine.newBuilder()
-                .maximumSize(100000)
-                .expireAfterWrite(10, TimeUnit.MINUTES)
-                .recordStats()
-                .build();
+        // ✅ 初始化追踪列表
+        pendingWrites = new CopyOnWriteArrayList<>();
 
-        System.out.println(String.format(
-                "[DeviceId算子-%d] 初始化成功, KVRocks: %s:%d, workerId=%d",
-                subtaskIndex, kvrocksHost, kvrocksPort, subtaskIndex
-        ));
+        LOG.info("[DeviceId算子-{}] 初始化成功, KVRocks: {}:{}, workerId={}",
+                subtaskIndex, kvrocksHost, kvrocksPort, subtaskIndex);
     }
 
     @Override
     public void asyncInvoke(RawEvent input, ResultFuture<IdOutput> resultFuture) throws Exception {
-
-        String cacheKey = input.getAppId() + ":" + input.getDid();
-
-        Long cachedDeviceId = deviceCache.getIfPresent(cacheKey);
-
-        if (cachedDeviceId != null) {
-            IdOutput output = createOutput(input, cachedDeviceId, false);
-            resultFuture.complete(Collections.singleton(output));
-            return;
-        }
-
         String hashKey = "d:" + input.getAppId();
         String field = input.getDid();
 
         kvrocks.asyncHGet(hashKey, field)
                 .thenCompose(value -> {
-
                     if (value != null) {
                         Long zgDeviceId = Long.parseLong(value);
-                        deviceCache.put(cacheKey, zgDeviceId);
-
                         IdOutput output = createOutput(input, zgDeviceId, false);
                         return CompletableFuture.completedFuture(output);
-
                     } else {
-                        // ✅ 雪花算法生成
                         Long newDeviceId = idGenerator.nextId();
 
-                        // ✅ Fire-and-Forget: 后台异步写入
-                        kvrocks.asyncHSet(hashKey, field, String.valueOf(newDeviceId))
+                        // ✅ 使用数组解决lambda作用域问题
+                        CompletableFuture<Void>[] futureHolder = new CompletableFuture[1];
+                        futureHolder[0] = kvrocks.asyncHSet(hashKey, field, String.valueOf(newDeviceId))
                                 .whenComplete((v, throwable) -> {
+                                    // 完成后从列表中移除
+                                    pendingWrites.remove(futureHolder[0]);
+
                                     if (throwable != null) {
-                                        System.err.println("DeviceId写入失败: " + hashKey + ":" + field);
+                                        LOG.error("[DeviceId算子-{}] DeviceId写入失败: {}:{}",
+                                                getRuntimeContext().getIndexOfThisSubtask(),
+                                                hashKey, field, throwable);
                                     }
                                 });
 
-                        // 立即返回
-                        deviceCache.put(cacheKey, newDeviceId);
-                        return CompletableFuture.completedFuture(
-                                createOutput(input, newDeviceId, true));
+                        // 添加到追踪列表
+                        pendingWrites.add(futureHolder[0]);
+
+                        return CompletableFuture.completedFuture(createOutput(input, newDeviceId, true));
                     }
                 })
                 .whenComplete((output, throwable) -> {
@@ -135,7 +120,7 @@ public class DeviceIdAsyncOperator extends RichAsyncFunction<RawEvent, IdOutput>
         output.setCuid(input.getCuid());
         output.setSid(input.getSid());
         output.setZgDeviceId(zgDeviceId);
-        output.setNewDevice(isNew);  // ✅ 设置是否新设备
+        output.setNewDevice(isNew);
         output.setEventName(input.getEventName());
         output.setTimestamp(input.getTimestamp());
         output.setIngestTime(input.getIngestTime());
@@ -144,16 +129,38 @@ public class DeviceIdAsyncOperator extends RichAsyncFunction<RawEvent, IdOutput>
 
     @Override
     public void close() throws Exception {
-        if (kvrocks != null) {
-            kvrocks.shutdown();
+        int subtaskIndex = getRuntimeContext().getIndexOfThisSubtask();
+
+        LOG.info("[DeviceId算子-{}] 开始关闭，等待未完成的写入...", subtaskIndex);
+
+        // ✅ 等待所有未完成的写入
+        if (pendingWrites != null && !pendingWrites.isEmpty()) {
+            long startWait = System.currentTimeMillis();
+            int pendingCount = pendingWrites.size();
+
+            LOG.info("[DeviceId算子-{}] 发现 {} 个未完成的写入操作，开始等待...",
+                    subtaskIndex, pendingCount);
+
+            try {
+                CompletableFuture<Void> allWrites = CompletableFuture.allOf(
+                        pendingWrites.toArray(new CompletableFuture[0])
+                );
+                allWrites.get(30, TimeUnit.SECONDS);
+
+                long waitTime = System.currentTimeMillis() - startWait;
+                LOG.info("[DeviceId算子-{}] ✅ 所有未完成的写入已完成，等待时间: {} ms",
+                        subtaskIndex, waitTime);
+
+            } catch (Exception e) {
+                long waitTime = System.currentTimeMillis() - startWait;
+                LOG.error("[DeviceId算子-{}] ⚠️  等待写入完成超时或失败，等待时间: {} ms, 剩余未完成: {}",
+                        subtaskIndex, waitTime, pendingWrites.size(), e);
+            }
         }
 
-        if (deviceCache != null) {
-            System.out.println(String.format(
-                    "[DeviceId算子-%d] 缓存统计: %s",
-                    getRuntimeContext().getIndexOfThisSubtask(),
-                    deviceCache.stats()
-            ));
+        if (kvrocks != null) {
+            kvrocks.shutdown();
+            LOG.info("[DeviceId算子-{}] KVRocks连接已关闭", subtaskIndex);
         }
     }
 }
