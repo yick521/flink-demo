@@ -3,12 +3,14 @@ package com.zhugeio.demo.operator.async;
 import com.zhugeio.demo.model.IdOutput;
 import org.apache.flink.streaming.api.functions.async.ResultFuture;
 import org.apache.flink.streaming.api.functions.async.RichAsyncFunction;
+
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.text.NumberFormat;
 import java.util.Collections;
 import java.util.concurrent.CompletableFuture;
+
 
 /**
  * 会话ID生成算子
