@@ -13,7 +13,7 @@ import org.slf4j.LoggerFactory;
 
 import java.util.Collections;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 
@@ -21,8 +21,8 @@ import java.util.concurrent.atomic.AtomicLong;
  * Zgid异步映射算子 - 优雅关闭版本
  *
  * 修复点:
- * 1. ✅ 使用CopyOnWriteArrayList追踪未完成的写入
- * 2. ✅ 使用数组解决lambda变量作用域问题
+ * 1. ✅ 使用ConcurrentHashMap追踪未完成的写入
+ * 2. ✅ O(1)时间复杂度的add/remove操作
  * 3. ✅ close()时等待所有未完成的写入
  * 4. ✅ 防止连接过早关闭导致数据丢失
  */
@@ -33,8 +33,9 @@ public class ZgidAsyncOperator extends RichAsyncFunction<IdOutput, IdOutput> {
     private transient KvrocksClient kvrocks;
     private transient SnowflakeIdGenerator idGenerator;
 
-    // ✅ 追踪未完成的写入操作
-    private transient CopyOnWriteArrayList<CompletableFuture<Void>> pendingWrites;
+    // ✅ 使用ConcurrentHashMap追踪未完成的写入操作
+    private transient ConcurrentHashMap<Long, CompletableFuture<Void>> pendingWrites;
+    private transient AtomicLong futureIdGenerator;
 
     // 统计指标
     private transient Counter totalWrites;
@@ -76,8 +77,9 @@ public class ZgidAsyncOperator extends RichAsyncFunction<IdOutput, IdOutput> {
         int workerId = 512 + subtaskIndex;
         idGenerator = new SnowflakeIdGenerator(workerId);
 
-        // ✅ 初始化追踪列表
-        pendingWrites = new CopyOnWriteArrayList<>();
+        // ✅ 初始化ConcurrentHashMap
+        pendingWrites = new ConcurrentHashMap<>(1024);
+        futureIdGenerator = new AtomicLong(0);
 
         writeFailureCount = new AtomicLong(0);
 
@@ -122,7 +124,7 @@ public class ZgidAsyncOperator extends RichAsyncFunction<IdOutput, IdOutput> {
                     } else {
                         input.setZgid(result.zgid);
                         input.setNewZgid(result.isNew);
-                        input.setIngestTime(System.currentTimeMillis()-input.getIngestTime());
+                        input.setLatency(System.currentTimeMillis()-input.getIngestTime());
                         resultFuture.complete(Collections.singleton(input));
                     }
                 });
@@ -139,12 +141,13 @@ public class ZgidAsyncOperator extends RichAsyncFunction<IdOutput, IdOutput> {
                 String.valueOf(newZgid)
         );
 
-        // ✅ 使用数组解决lambda作用域问题
-        CompletableFuture<Void>[] futureHolder = new CompletableFuture[1];
-        futureHolder[0] = CompletableFuture.allOf(writeMain, writeDevice)
+        // ✅ 生成唯一ID作为key
+        Long futureId = futureIdGenerator.incrementAndGet();
+
+        CompletableFuture<Void> combinedFuture = CompletableFuture.allOf(writeMain, writeDevice)
                 .whenComplete((v, throwable) -> {
-                    // 完成后从列表中移除
-                    pendingWrites.remove(futureHolder[0]);
+                    // ✅ O(1)时间复杂度删除
+                    pendingWrites.remove(futureId);
 
                     if (throwable != null) {
                         long failCount = writeFailureCount.incrementAndGet();
@@ -157,8 +160,8 @@ public class ZgidAsyncOperator extends RichAsyncFunction<IdOutput, IdOutput> {
                     }
                 });
 
-        // 添加到追踪列表
-        pendingWrites.add(futureHolder[0]);
+        // ✅ O(1)时间复杂度添加
+        pendingWrites.put(futureId, combinedFuture);
     }
 
     /**
@@ -181,11 +184,13 @@ public class ZgidAsyncOperator extends RichAsyncFunction<IdOutput, IdOutput> {
                 String.valueOf(zgid)
         );
 
-        // ✅ 使用数组解决lambda作用域问题
-        CompletableFuture<Void>[] retryHolder = new CompletableFuture[1];
-        retryHolder[0] = CompletableFuture.allOf(writeMain, writeDevice)
+        // ✅ 生成唯一ID作为key
+        Long futureId = futureIdGenerator.incrementAndGet();
+
+        CompletableFuture<Void> retryFuture = CompletableFuture.allOf(writeMain, writeDevice)
                 .whenComplete((v, throwable) -> {
-                    pendingWrites.remove(retryHolder[0]);
+                    // ✅ O(1)时间复杂度删除
+                    pendingWrites.remove(futureId);
 
                     if (throwable != null) {
                         LOG.error("[Zgid算子-{}] 第{}次重试失败: key={}",
@@ -199,7 +204,8 @@ public class ZgidAsyncOperator extends RichAsyncFunction<IdOutput, IdOutput> {
                     }
                 });
 
-        pendingWrites.add(retryHolder[0]);
+        // ✅ O(1)时间复杂度添加
+        pendingWrites.put(futureId, retryFuture);
     }
 
     @Override
@@ -216,7 +222,7 @@ public class ZgidAsyncOperator extends RichAsyncFunction<IdOutput, IdOutput> {
 
             try {
                 CompletableFuture<Void> allWrites = CompletableFuture.allOf(
-                        pendingWrites.toArray(new CompletableFuture[0])
+                        pendingWrites.values().toArray(new CompletableFuture[0])
                 );
                 allWrites.get(30, TimeUnit.SECONDS);
 

@@ -12,15 +12,16 @@ import org.slf4j.LoggerFactory;
 
 import java.util.Collections;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * 用户ID映射算子 - 优雅关闭版本
  *
  * 修复点:
- * 1. ✅ 使用CopyOnWriteArrayList追踪未完成的写入
- * 2. ✅ 使用数组解决lambda变量作用域问题
+ * 1. ✅ 使用ConcurrentHashMap追踪未完成的写入
+ * 2. ✅ O(1)时间复杂度的add/remove操作
  * 3. ✅ close()时等待所有未完成的写入
  * 4. ✅ 防止连接过早关闭导致数据丢失
  */
@@ -31,8 +32,9 @@ public class UserIdAsyncOperator extends RichAsyncFunction<IdOutput, IdOutput> {
     private transient KvrocksClient kvrocks;
     private transient SnowflakeIdGenerator idGenerator;
 
-    // ✅ 追踪未完成的写入
-    private transient CopyOnWriteArrayList<CompletableFuture<Void>> pendingWrites;
+    // ✅ 使用ConcurrentHashMap追踪未完成的写入
+    private transient ConcurrentHashMap<Long, CompletableFuture<Void>> pendingWrites;
+    private transient AtomicLong futureIdGenerator;
 
     private final String kvrocksHost;
     private final int kvrocksPort;
@@ -67,8 +69,9 @@ public class UserIdAsyncOperator extends RichAsyncFunction<IdOutput, IdOutput> {
         int workerId = 256 + subtaskIndex;
         idGenerator = new SnowflakeIdGenerator(workerId);
 
-        // ✅ 初始化追踪列表
-        pendingWrites = new CopyOnWriteArrayList<>();
+        // ✅ 初始化ConcurrentHashMap
+        pendingWrites = new ConcurrentHashMap<>(1024);
+        futureIdGenerator = new AtomicLong(0);
 
         LOG.info("[UserId算子-{}] 雪花算法初始化成功, workerId={}", subtaskIndex, workerId);
     }
@@ -92,12 +95,13 @@ public class UserIdAsyncOperator extends RichAsyncFunction<IdOutput, IdOutput> {
                     } else {
                         Long newUserId = idGenerator.nextId();
 
-                        // ✅ 使用数组解决lambda作用域问题
-                        CompletableFuture<Void>[] futureHolder = new CompletableFuture[1];
-                        futureHolder[0] = kvrocks.asyncSet(cacheKey, String.valueOf(newUserId))
+                        // ✅ 生成唯一ID作为key
+                        Long futureId = futureIdGenerator.incrementAndGet();
+
+                        CompletableFuture<Void> writeFuture = kvrocks.asyncSet(cacheKey, String.valueOf(newUserId))
                                 .whenComplete((v, throwable) -> {
-                                    // 完成后从列表中移除
-                                    pendingWrites.remove(futureHolder[0]);
+                                    // ✅ O(1)时间复杂度删除
+                                    pendingWrites.remove(futureId);
 
                                     if (throwable != null) {
                                         LOG.error("[UserId算子-{}] UserId写入失败: {}",
@@ -106,8 +110,8 @@ public class UserIdAsyncOperator extends RichAsyncFunction<IdOutput, IdOutput> {
                                     }
                                 });
 
-                        // 添加到追踪列表
-                        pendingWrites.add(futureHolder[0]);
+                        // ✅ O(1)时间复杂度添加
+                        pendingWrites.put(futureId, writeFuture);
 
                         return CompletableFuture.completedFuture(new UserIdResult(newUserId, true));
                     }
@@ -139,7 +143,7 @@ public class UserIdAsyncOperator extends RichAsyncFunction<IdOutput, IdOutput> {
 
             try {
                 CompletableFuture<Void> allWrites = CompletableFuture.allOf(
-                        pendingWrites.toArray(new CompletableFuture[0])
+                        pendingWrites.values().toArray(new CompletableFuture[0])
                 );
                 allWrites.get(30, TimeUnit.SECONDS);
 
