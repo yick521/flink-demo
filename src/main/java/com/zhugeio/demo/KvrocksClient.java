@@ -45,30 +45,36 @@ public class KvrocksClient implements Serializable {
         this.isCluster = isCluster;
     }
 
+    // 使用静态连接池，所有算子共享
+    private static volatile RedisClusterClient sharedClusterClient;
+    private static volatile RedisClient sharedStandaloneClient;
+    private static final Object LOCK = new Object();
+
     /**
      * 初始化Lettuce连接
      */
     public void init() {
         if (isCluster) {
-            // 集群模式
-            clusterClient = RedisClusterClient.create(
-                    RedisURI.Builder
-                            .redis(host, port)
-                            .withTimeout(Duration.ofSeconds(60))
-                            .build()
-            );
+            if (sharedClusterClient == null) {
+                synchronized (LOCK) {
+                    if (sharedClusterClient == null) {
+                        sharedClusterClient = RedisClusterClient.create(
+                                RedisURI.Builder
+                                        .redis(host, port)
+                                        .withTimeout(Duration.ofSeconds(60))
+                                        .build()
+                        );
 
-            // ✅ 使用 ClusterClientOptions
-            clusterClient.setOptions(ClusterClientOptions.builder()
-                    .autoReconnect(true)
-                    .pingBeforeActivateConnection(true)
-                    .timeoutOptions(TimeoutOptions.enabled(Duration.ofMillis(60000)))
-                    .build());
-
-            clusterConnection = clusterClient.connect();
-
-            LOG.info("✅ Lettuce集群连接初始化成功：{}:{} (真异步模式)", host, port);
-
+                        // 增加连接池大小
+                        sharedClusterClient.setOptions(ClusterClientOptions.builder()
+                                .autoReconnect(true)
+                                .maxRedirects(8)
+                                .timeoutOptions(TimeoutOptions.enabled(Duration.ofMillis(60000)))
+                                .build());
+                    }
+                }
+            }
+            clusterConnection = sharedClusterClient.connect();
         } else {
             // 单机模式
             standaloneClient = RedisClient.create(
